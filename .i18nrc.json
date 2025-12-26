@@ -1,0 +1,7 @@
+{
+  "prefix": "processTreeViewer",
+  "paths": {
+    "processTreeViewer": "."
+  },
+  "translations": ["translations/ja-JP.json"]
+}
