@@ -4,10 +4,7 @@ import { CoreStart, AppMountParameters } from '../../../src/core/public';
 import { ProcessTreeViewerApp } from './components/app';
 
 export const renderApp = (params: AppMountParameters, core: CoreStart) => {
-  ReactDOM.render(
-    <ProcessTreeViewerApp http={core.http} />,
-    params.element
-  );
+  ReactDOM.render(<ProcessTreeViewerApp http={core.http} />, params.element);
 
   return () => ReactDOM.unmountComponentAtNode(params.element);
 };

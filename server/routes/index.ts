@@ -1,7 +1,6 @@
 import { IRouter } from 'src/core/server';
 import { schema } from '@osd/config-schema';
 
-// Интерфейсы для типизации OpenSearch ответов
 interface AggregationBucket {
   key: string;
   doc_count: number;
@@ -45,8 +44,6 @@ interface CatIndicesResponse {
 }
 
 export function defineRoutes(router: IRouter) {
-  
-  // Получить список индексов
   router.get(
     {
       path: '/api/process_tree/indices',
@@ -58,19 +55,19 @@ export function defineRoutes(router: IRouter) {
     },
     async (context, request, response) => {
       try {
-        const result = await context.core.opensearch.client.asCurrentUser.cat.indices({
+        const result = (await context.core.opensearch.client.asCurrentUser.cat.indices({
           format: 'json',
           index: request.query.pattern,
           h: ['index', 'health', 'status', 'docs.count', 'store.size'],
-        }) as CatIndicesResponse;
-        
-        // Фильтруем системные индексы
-        const filteredIndices = result.body.filter((index) => 
-          !index.index.startsWith('.') && 
-          !index.index.includes('security-auditlog') &&
-          !index.index.includes('top_queries')
+        })) as CatIndicesResponse;
+
+        const filteredIndices = result.body.filter(
+          (index) =>
+            !index.index.startsWith('.') &&
+            !index.index.includes('security-auditlog') &&
+            !index.index.includes('top_queries')
         );
-        
+
         return response.ok({
           body: {
             success: true,
@@ -87,7 +84,6 @@ export function defineRoutes(router: IRouter) {
     }
   );
 
-  // Получить список агентов из индекса
   router.get(
     {
       path: '/api/process_tree/agents/{index}',
@@ -99,7 +95,7 @@ export function defineRoutes(router: IRouter) {
     },
     async (context, request, response) => {
       try {
-        const result = await context.core.opensearch.client.asCurrentUser.search({
+        const result = (await context.core.opensearch.client.asCurrentUser.search({
           index: request.params.index,
           body: {
             size: 0,
@@ -120,11 +116,11 @@ export function defineRoutes(router: IRouter) {
               },
             },
           },
-        }) as { body: AggregationResponse };
+        })) as { body: AggregationResponse };
 
         const responseBody = result.body as AggregationResponse;
         const buckets = responseBody.aggregations?.agents?.buckets || [];
-        
+
         const agents = buckets.map((bucket) => ({
           id: bucket.key,
           name: bucket.agent_names?.buckets?.[0]?.key || bucket.key,
@@ -147,7 +143,6 @@ export function defineRoutes(router: IRouter) {
     }
   );
 
-  // Получить данные процессов с фильтрацией по времени
   router.post(
     {
       path: '/api/process_tree/processes',
@@ -166,8 +161,7 @@ export function defineRoutes(router: IRouter) {
     async (context, request, response) => {
       try {
         const { index, timeRange, limit, agentId } = request.body;
-        
-        // Базовый запрос для поиска процессов
+
         const baseQuery: any = {
           bool: {
             must: [
@@ -193,40 +187,39 @@ export function defineRoutes(router: IRouter) {
           },
         };
 
-        // Фильтр по агенту если указан
         if (agentId) {
           baseQuery.bool.must.push({
             term: { 'agent.id': agentId },
           });
         }
 
-        const result = await context.core.opensearch.client.asCurrentUser.search({
+        const result = (await context.core.opensearch.client.asCurrentUser.search({
           index: index,
           body: {
             query: baseQuery,
             size: limit,
             sort: [{ '@timestamp': { order: 'desc' } }],
           },
-        }) as { body: SearchResponse };
+        })) as { body: SearchResponse };
 
-        // Обрабатываем результаты
-        const processes = result.body.hits.hits.map((hit) => {
-          const source = hit._source;
-          
-          // Пробуем разные форматы данных
-          let processInfo = extractProcessInfo(source);
-          
-          return {
-            ...processInfo,
-            _id: hit._id,
-            _index: hit._index,
-            _score: hit._score,
-            timestamp: source['@timestamp'],
-            agent: source.agent,
-            rule: source.rule,
-            rawData: source, // Сохраняем все данные для отображения
-          };
-        }).filter((p: any) => p.pid && p.pid > 0);
+        const processes = result.body.hits.hits
+          .map((hit) => {
+            const source = hit._source;
+
+            let processInfo = extractProcessInfo(source);
+
+            return {
+              ...processInfo,
+              _id: hit._id,
+              _index: hit._index,
+              _score: hit._score,
+              timestamp: source['@timestamp'],
+              agent: source.agent,
+              rule: source.rule,
+              rawData: source,
+            };
+          })
+          .filter((p: any) => p.pid && p.pid > 0);
 
         return response.ok({
           body: {
@@ -247,9 +240,7 @@ export function defineRoutes(router: IRouter) {
   );
 }
 
-// Вспомогательная функция для извлечения информации о процессе - ОБНОВЛЕНА
 function extractProcessInfo(source: any): any {
-  // Вариант 1: Wazuh audit формат
   if (source.data?.audit) {
     const audit = source.data.audit;
     return {
@@ -258,14 +249,13 @@ function extractProcessInfo(source: any): any {
       name: audit.exe ? audit.exe.split('/').pop() : audit.command?.split(' ')[0] || 'unknown',
       exe: audit.exe,
       command: audit.command,
-      cwd: audit.cwd, // Добавлено
+      cwd: audit.cwd,
       uid: parseInt(audit.uid) || 0,
       gid: parseInt(audit.gid) || 0,
       type: 'audit',
     };
   }
-  
-  // Вариант 2: Windows events
+
   if (source.data?.win?.eventdata) {
     const eventdata = source.data.win.eventdata;
     return {
@@ -278,8 +268,7 @@ function extractProcessInfo(source: any): any {
       type: 'windows',
     };
   }
-  
-  // Вариант 3: Sysmon
+
   if (source.data?.sysmon) {
     const sysmon = source.data.sysmon;
     return {
@@ -292,8 +281,7 @@ function extractProcessInfo(source: any): any {
       type: 'sysmon',
     };
   }
-  
-  // Вариант 4: Общий формат
+
   return {
     pid: parseInt(source.pid) || parseInt(source.processId) || 0,
     ppid: parseInt(source.ppid) || parseInt(source.parentProcessId) || 0,

@@ -1,16 +1,9 @@
-import { 
-  PluginInitializerContext, 
-  CoreSetup, 
-  CoreStart, 
-  Plugin,
-  Logger 
-} from 'src/core/server';
+import { PluginInitializerContext, CoreSetup, CoreStart, Plugin, Logger } from 'src/core/server';
 import { defineRoutes } from './routes';
 import { ProcessTreeViewerPluginSetup, ProcessTreeViewerPluginStart } from './types';
 
-export class ProcessTreeViewerPlugin 
-  implements Plugin<ProcessTreeViewerPluginSetup, ProcessTreeViewerPluginStart> 
-{
+export class ProcessTreeViewerPlugin
+  implements Plugin<ProcessTreeViewerPluginSetup, ProcessTreeViewerPluginStart> {
   private readonly logger: Logger;
 
   constructor(private readonly initializerContext: PluginInitializerContext) {
@@ -19,11 +12,11 @@ export class ProcessTreeViewerPlugin
 
   public setup(core: CoreSetup): ProcessTreeViewerPluginSetup {
     const router = core.http.createRouter();
-    
+
     defineRoutes(router);
-    
+
     this.logger.info('ProcessTreeViewerPlugin setup complete');
-    
+
     return {};
   }
 
