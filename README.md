@@ -1,4 +1,4 @@
-# processTreeViewer
+# process_tree_viewer
 
 A OpenSearch Dashboards plugin
 

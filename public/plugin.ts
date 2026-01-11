@@ -1,45 +1,38 @@
-import { i18n } from '@osd/i18n';
-import { AppMountParameters, CoreSetup, CoreStart, Plugin } from '../../../src/core/public';
-import {
-  ProcessTreeViewerPluginSetup,
-  ProcessTreeViewerPluginStart,
-  AppPluginStartDependencies,
-} from './types';
+import { Plugin, CoreSetup, CoreStart, AppMountParameters } from '../../../src/core/public';
 import { PLUGIN_NAME } from '../common';
 
+export interface ProcessTreeViewerSetup {}
+export interface ProcessTreeViewerStart {}
+
 export class ProcessTreeViewerPlugin
-  implements Plugin<ProcessTreeViewerPluginSetup, ProcessTreeViewerPluginStart> {
-  public setup(core: CoreSetup): ProcessTreeViewerPluginSetup {
-    // Register an application into the side navigation menu
+  implements Plugin<ProcessTreeViewerSetup, ProcessTreeViewerStart> {
+  public setup(core: CoreSetup): ProcessTreeViewerSetup {
     core.application.register({
       id: 'processTreeViewer',
       title: PLUGIN_NAME,
+      category: {
+        id: 'opensearch',
+        label: 'OpenSearch Plugins',
+        order: 2000,
+      },
+      order: 100,
       async mount(params: AppMountParameters) {
-        // Load application bundle
         const { renderApp } = await import('./application');
-        // Get start services as specified in opensearch_dashboards.json
-        const [coreStart, depsStart] = await core.getStartServices();
-        // Render the application
-        return renderApp(coreStart, depsStart as AppPluginStartDependencies, params);
+
+        const [coreStart] = await core.getStartServices();
+
+        return renderApp(params, coreStart);
       },
     });
 
-    // Return methods that should be available to other plugins
-    return {
-      getGreeting() {
-        return i18n.translate('processTreeViewer.greetingText', {
-          defaultMessage: 'Hello from {name}!',
-          values: {
-            name: PLUGIN_NAME,
-          },
-        });
-      },
-    };
+    return {};
   }
 
-  public start(core: CoreStart): ProcessTreeViewerPluginStart {
+  public start(coreStart: CoreStart): ProcessTreeViewerStart {
     return {};
   }
 
   public stop() {}
 }
+
+export const plugin = () => new ProcessTreeViewerPlugin();

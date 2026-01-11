@@ -1,23 +1,10 @@
 import React from 'react';
 import ReactDOM from 'react-dom';
-import { AppMountParameters, CoreStart } from '../../../src/core/public';
-import { AppPluginStartDependencies } from './types';
+import { CoreStart, AppMountParameters } from '../../../src/core/public';
 import { ProcessTreeViewerApp } from './components/app';
 
-export const renderApp = (
-  { notifications, http }: CoreStart,
-  { navigation }: AppPluginStartDependencies,
-  { appBasePath, element }: AppMountParameters
-) => {
-  ReactDOM.render(
-    <ProcessTreeViewerApp
-      basename={appBasePath}
-      notifications={notifications}
-      http={http}
-      navigation={navigation}
-    />,
-    element
-  );
+export const renderApp = (params: AppMountParameters, core: CoreStart) => {
+  ReactDOM.render(<ProcessTreeViewerApp http={core.http} />, params.element);
 
-  return () => ReactDOM.unmountComponentAtNode(element);
+  return () => ReactDOM.unmountComponentAtNode(params.element);
 };
