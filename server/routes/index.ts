@@ -95,37 +95,149 @@ export function defineRoutes(router: IRouter) {
     },
     async (context, request, response) => {
       try {
-        const result = (await context.core.opensearch.client.asCurrentUser.search({
-          index: request.params.index,
-          body: {
-            size: 0,
-            aggs: {
-              agents: {
-                terms: {
-                  field: 'agent.id',
-                  size: 100,
+        console.log('Loading agents for index:', request.params.index);
+
+        const possibleFields = [
+          'agent.id.keyword',
+          'agent.id',
+          'agent_id',
+        ];
+
+        let result;
+        let successField = null;
+
+        for (const field of possibleFields) {
+          try {
+            result = await context.core.opensearch.client.asCurrentUser.search({
+              index: request.params.index,
+              body: {
+                size: 0,
+                query: {
+                  bool: {
+                    must: [
+                      {
+                        range: {
+                          '@timestamp': {
+                            gte: 'now-7d',
+                          },
+                        },
+                      },
+                      {
+                        exists: {
+                          field: 'agent.id',
+                        },
+                      },
+                    ],
+                  },
                 },
                 aggs: {
-                  agent_names: {
+                  agents: {
                     terms: {
-                      field: 'agent.name',
-                      size: 1,
+                      field: field,
+                      size: 1000,
+                    },
+                    aggs: {
+                      agent_names: {
+                        terms: {
+                          field: 'agent.name.keyword',
+                          size: 1,
+                        },
+                      },
                     },
                   },
                 },
               },
+            });
+
+            const responseBody = result.body as AggregationResponse;
+            if (responseBody.aggregations?.agents?.buckets && 
+                responseBody.aggregations.agents.buckets.length > 0) {
+              successField = field;
+              console.log('Successfully used field:', field);
+              break;
+            }
+          } catch (err) {
+            console.log('Failed with field:', field);
+            continue;
+          }
+        }
+
+        if (!result || !successField) {
+          console.log('Aggregation failed, using search method');
+          
+          const searchResult = await context.core.opensearch.client.asCurrentUser.search({
+            index: request.params.index,
+            body: {
+              size: 1000,
+              query: {
+                bool: {
+                  must: [
+                    {
+                      range: {
+                        '@timestamp': {
+                          gte: 'now-7d',
+                        },
+                      },
+                    },
+                    {
+                      exists: {
+                        field: 'agent.id',
+                      },
+                    },
+                  ],
+                },
+              },
+              _source: ['agent.id', 'agent.name'],
+              collapse: {
+                field: 'agent.id.keyword',
+              },
             },
-          },
-        })) as { body: AggregationResponse };
+          });
+
+          const agentsMap = new Map<string, { id: string; name: string; count: number }>();
+          
+          const hits = (searchResult.body as SearchResponse).hits.hits;
+          hits.forEach((hit: any) => {
+            const agentId = hit._source?.agent?.id;
+            const agentName = hit._source?.agent?.name;
+            
+            if (agentId) {
+              if (!agentsMap.has(agentId)) {
+                agentsMap.set(agentId, {
+                  id: agentId,
+                  name: agentName || agentId,
+                  count: 1,
+                });
+              } else {
+                const agent = agentsMap.get(agentId)!;
+                agent.count++;
+              }
+            }
+          });
+
+          const agents = Array.from(agentsMap.values());
+          console.log('Found agents via search:', agents);
+
+          return response.ok({
+            body: {
+              success: true,
+              agents: agents,
+            },
+          });
+        }
 
         const responseBody = result.body as AggregationResponse;
         const buckets = responseBody.aggregations?.agents?.buckets || [];
+
+        console.log('Found buckets:', buckets.length);
 
         const agents = buckets.map((bucket) => ({
           id: bucket.key,
           name: bucket.agent_names?.buckets?.[0]?.key || bucket.key,
           count: bucket.doc_count,
         }));
+
+        console.log('Processed agents:', agents);
 
         return response.ok({
           body: {
@@ -134,9 +246,12 @@ export function defineRoutes(router: IRouter) {
           },
         });
       } catch (error: any) {
-        return response.badRequest({
+        console.error('Error loading agents:', error);
+        return response.ok({
           body: {
-            message: error.message,
+            success: true,
+            agents: [],
+            error: error.message,
           },
         });
       }
@@ -154,13 +269,14 @@ export function defineRoutes(router: IRouter) {
             to: schema.string(),
           }),
           limit: schema.number({ defaultValue: 1000 }),
-          agentId: schema.maybe(schema.string()),
+          offset: schema.number({ defaultValue: 0 }),
+          agentIds: schema.maybe(schema.arrayOf(schema.string())),
         }),
       },
     },
     async (context, request, response) => {
       try {
-        const { index, timeRange, limit, agentId } = request.body;
+        const { index, timeRange, limit, offset, agentIds } = request.body;
 
         const baseQuery: any = {
           bool: {
@@ -187,9 +303,9 @@ export function defineRoutes(router: IRouter) {
           },
         };
 
-        if (agentId) {
+        if (agentIds && agentIds.length > 0) {
           baseQuery.bool.must.push({
-            term: { 'agent.id': agentId },
+            terms: { 'agent.id': agentIds },
           });
         }
 
@@ -198,6 +314,7 @@ export function defineRoutes(router: IRouter) {
           body: {
             query: baseQuery,
             size: limit,
+            from: offset,
             sort: [{ '@timestamp': { order: 'desc' } }],
           },
         })) as { body: SearchResponse };
@@ -205,7 +322,6 @@ export function defineRoutes(router: IRouter) {
         const processes = result.body.hits.hits
           .map((hit) => {
             const source = hit._source;
-
             let processInfo = extractProcessInfo(source);
 
             return {
@@ -217,6 +333,7 @@ export function defineRoutes(router: IRouter) {
               agent: source.agent,
               rule: source.rule,
               rawData: source,
+              source_index: hit._index,
             };
           })
           .filter((p: any) => p.pid && p.pid > 0);
@@ -230,6 +347,7 @@ export function defineRoutes(router: IRouter) {
           },
         });
       } catch (error: any) {
+        console.error('Error loading processes:', error);
         return response.badRequest({
           body: {
             message: error.message,
@@ -243,16 +361,35 @@ export function defineRoutes(router: IRouter) {
 function extractProcessInfo(source: any): any {
   if (source.data?.audit) {
     const audit = source.data.audit;
+    
+    let fullCommand = audit.command;
+    if (audit.execve) {
+      const args: string[] = [];
+      const argc = parseInt(audit.execve.argc || '0');
+      
+      for (let i = 0; i < argc; i++) {
+        const argKey = `a${i}`;
+        if (audit.execve[argKey]) {
+          args.push(audit.execve[argKey]);
+        }
+      }
+      
+      if (args.length > 0) {
+        fullCommand = args.join(' ');
+      }
+    }
+    
     return {
       pid: parseInt(audit.pid) || 0,
       ppid: parseInt(audit.ppid) || 0,
       name: audit.exe ? audit.exe.split('/').pop() : audit.command?.split(' ')[0] || 'unknown',
       exe: audit.exe,
-      command: audit.command,
+      command: fullCommand || audit.command,
       cwd: audit.cwd,
       uid: parseInt(audit.uid) || 0,
       gid: parseInt(audit.gid) || 0,
       type: 'audit',
+      execve: audit.execve,
     };
   }
 

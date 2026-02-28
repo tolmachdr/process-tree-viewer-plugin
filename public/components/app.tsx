@@ -39,6 +39,9 @@ import {
   EuiSwitch,
   EuiProgress,
   EuiTextColor,
+  EuiComboBox,
+  EuiEmptyPrompt,
+  EuiButtonEmpty,
 } from '@elastic/eui';
 
 interface Process {
@@ -64,6 +67,10 @@ interface Process {
   cwd?: string;
   rawData?: any;
   isNew?: boolean;
+  execve?: {
+    argc?: string;
+    [key: string]: string | undefined;
+  };
 }
 
 interface ProcessNode extends Process {
@@ -79,6 +86,12 @@ interface IndexInfo {
   'store.size': string;
 }
 
+interface Agent {
+  id: string;
+  name: string;
+  count: number;
+}
+
 interface TimeRange {
   text: string;
   value: string;
@@ -90,6 +103,11 @@ interface Props {
     post: (path: string, options?: any) => Promise<any>;
   };
 }
+
+type ComboBoxOption = {
+  label: string;
+  value?: string;
+};
 
 const TIME_RANGES: TimeRange[] = [
   { text: '5 minutes', value: 'now-5m' },
@@ -104,17 +122,26 @@ const TIME_RANGES: TimeRange[] = [
   { text: '1 week', value: 'now-1w' },
 ];
 
+const PAGE_SIZE = 500;
+
 export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
+  const [isInitialized, setIsInitialized] = useState(false);
+  
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [loadingIndices, setLoadingIndices] = useState(false);
+  const [loadingAgents, setLoadingAgents] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [processes, setProcesses] = useState<Process[]>([]);
   const [indices, setIndices] = useState<IndexInfo[]>([]);
+  const [agents, setAgents] = useState<Agent[]>([]);
   const [selectedIndex, setSelectedIndex] = useState<string>('');
+  const [selectedAgents, setSelectedAgents] = useState<ComboBoxOption[]>([]);
   const [selectedTimeRange, setSelectedTimeRange] = useState<TimeRange>(TIME_RANGES[3]);
   const [customTimeRange, setCustomTimeRange] = useState({ from: 'now-1h', to: 'now' });
   const [searchQuery, setSearchQuery] = useState('');
-  const [limit, setLimit] = useState<number>(500);
+  const [hasMore, setHasMore] = useState(true);
+  const [currentOffset, setCurrentOffset] = useState(0);
   const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>({});
   const [viewMode, setViewMode] = useState<'tree' | 'list'>('tree');
   const [showSystemProcesses, setShowSystemProcesses] = useState(false);
@@ -127,38 +154,92 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
 
   const lastTimestampRef = useRef<string | null>(null);
   const processMapRef = useRef<Map<string, Process>>(new Map());
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const loadingMoreRef = useRef(false);
 
-  const initialLoad = useCallback(async () => {
+  const getSelectedAgentIds = useCallback((): string[] => {
+    return selectedAgents
+      .map(a => a.value)
+      .filter((v): v is string => v !== undefined);
+  }, [selectedAgents]);
+
+  const loadAgents = useCallback(async () => {
+    if (!selectedIndex) {
+      console.log('No index selected for loading agents');
+      return;
+    }
+
+    console.log('Loading agents for index:', selectedIndex);
+    setLoadingAgents(true);
+    setAgents([]);
+    
+    try {
+      const response = await http.get(`/api/process_tree/agents/${encodeURIComponent(selectedIndex)}`);
+      console.log('Agents response:', response);
+
+      if (response.success && response.agents) {
+        console.log('Found agents:', response.agents.length);
+        setAgents(response.agents);
+      } else {
+        console.log('No agents in response');
+        setAgents([]);
+      }
+    } catch (err: any) {
+      console.error('Error loading agents:', err);
+      setAgents([]);
+    } finally {
+      setLoadingAgents(false);
+    }
+  }, [http, selectedIndex]);
+
+  const loadProcesses = useCallback(async (offset: number, isInitial: boolean = false) => {
     if (!selectedIndex) {
       setError('Выберите индекс для поиска процессов');
       return;
     }
 
-    setLoading(true);
+    if (isInitial) {
+      setLoading(true);
+    } else {
+      setLoadingMore(true);
+      loadingMoreRef.current = true;
+    }
+    
     setError(null);
 
     try {
       const timeFrom = selectedTimeRange.value || customTimeRange.from;
+      const agentIds = getSelectedAgentIds();
 
       const response = await http.post('/api/process_tree/processes', {
         body: JSON.stringify({
           index: selectedIndex,
           timeRange: {
             from: timeFrom,
-            to: 'now',
+            to: customTimeRange.to,
           },
-          limit: limit,
+          limit: PAGE_SIZE,
+          offset: offset, // ДОБАВИТЬ
+          agentIds: agentIds.length > 0 ? agentIds : undefined,
         }),
       });
 
       if (response.success) {
         const processesWithFlag = response.processes.map((p: Process) => ({ ...p, isNew: false }));
-        setProcesses(processesWithFlag);
+        
+        if (isInitial) {
+          setProcesses(processesWithFlag);
+          processMapRef.current.clear();
+        } else {
+          setProcesses(prev => [...prev, ...processesWithFlag]);
+        }
 
-        processMapRef.current.clear();
         processesWithFlag.forEach((p: Process) => {
           processMapRef.current.set(p._id, p);
         });
+
+        setHasMore(processesWithFlag.length === PAGE_SIZE);
+        setCurrentOffset(offset + processesWithFlag.length);
 
         if (processesWithFlag.length > 0) {
           const timestamps = processesWithFlag.map((p: Process) => new Date(p.timestamp).getTime());
@@ -173,18 +254,61 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
     } catch (err: any) {
       setError(`Ошибка: ${err.message}`);
     } finally {
-      setLoading(false);
+      if (isInitial) {
+        setLoading(false);
+      } else {
+        setLoadingMore(false);
+        loadingMoreRef.current = false;
+      }
     }
-  }, [http, selectedIndex, selectedTimeRange, customTimeRange, limit]);
+  }, [http, selectedIndex, selectedTimeRange, customTimeRange, getSelectedAgentIds]);
+
+  const initialLoad = useCallback(async () => {
+    setCurrentOffset(0);
+    setHasMore(true);
+    await loadProcesses(0, true);
+  }, [loadProcesses]);
+
+  const loadMore = useCallback(() => {
+    if (!loadingMoreRef.current && hasMore && !loading) {
+      loadProcesses(currentOffset, false);
+    }
+  }, [loadProcesses, currentOffset, hasMore, loading]);
+
+  const handleScroll = useCallback((e: Event) => {
+    const target = e.target as HTMLDivElement;
+    if (!target) return;
+
+    const { scrollTop, scrollHeight, clientHeight } = target;
+    const scrollPercentage = (scrollTop + clientHeight) / scrollHeight;
+
+    // Загружаем больше данных когда пользователь прокрутил 80%
+    if (scrollPercentage > 0.8 && hasMore && !loadingMoreRef.current && !loading) {
+      loadMore();
+    }
+  }, [hasMore, loading, loadMore]);
+
+  // ДОБАВИТЬ useEffect для скролла
+  useEffect(() => {
+    const scrollContainer = scrollContainerRef.current;
+    if (scrollContainer) {
+      scrollContainer.addEventListener('scroll', handleScroll);
+      return () => {
+        scrollContainer.removeEventListener('scroll', handleScroll);
+      };
+    }
+  }, [handleScroll]);
 
   const incrementalUpdate = useCallback(async () => {
-    if (!selectedIndex || !lastTimestampRef.current || loading) {
+    if (!selectedIndex || !lastTimestampRef.current || loading || !isInitialized) {
       return;
     }
 
     setIsUpdating(true);
 
     try {
+      const agentIds = getSelectedAgentIds();
+
       const response = await http.post('/api/process_tree/processes', {
         body: JSON.stringify({
           index: selectedIndex,
@@ -193,6 +317,7 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
             to: 'now',
           },
           limit: 1000,
+          agentIds: agentIds.length > 0 ? agentIds : undefined,
         }),
       });
 
@@ -214,14 +339,6 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
             updated.sort(
               (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
             );
-
-            const maxProcesses = limit * 2;
-            if (updated.length > maxProcesses) {
-              const removed = updated.slice(maxProcesses);
-              removed.forEach((p) => processMapRef.current.delete(p._id));
-
-              return updated.slice(0, maxProcesses);
-            }
 
             return updated;
           });
@@ -245,7 +362,7 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
     } finally {
       setIsUpdating(false);
     }
-  }, [http, selectedIndex, loading, limit]);
+  }, [http, selectedIndex, loading, getSelectedAgentIds, isInitialized]);
 
   const loadIndices = useCallback(async () => {
     setLoadingIndices(true);
@@ -256,19 +373,13 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
 
       if (response.success) {
         setIndices(response.indices);
-        if (response.indices.length > 0 && !selectedIndex) {
-          const wazuhIndex = response.indices.find(
-            (i: IndexInfo) => i.index.includes('wazuh') || i.index.includes('alerts')
-          );
-          setSelectedIndex(wazuhIndex?.index || response.indices[0].index);
-        }
       }
     } catch (err: any) {
       setError(`Ошибка загрузки индексов: ${err.message}`);
     } finally {
       setLoadingIndices(false);
     }
-  }, [http, selectedIndex]);
+  }, [http]);
 
   useEffect(() => {
     loadIndices();
@@ -276,96 +387,113 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
 
   useEffect(() => {
     if (selectedIndex) {
-      initialLoad();
+      loadAgents();
     }
-  }, [selectedIndex, selectedTimeRange, customTimeRange, limit]);
+  }, [selectedIndex, loadAgents]);
 
   useEffect(() => {
-    if (!autoRefresh || !selectedIndex) return;
+    if (!autoRefresh || !selectedIndex || !isInitialized) return;
 
     const intervalId = setInterval(() => {
       incrementalUpdate();
     }, 10000);
 
     return () => clearInterval(intervalId);
-  }, [autoRefresh, selectedIndex, incrementalUpdate]);
+  }, [autoRefresh, selectedIndex, incrementalUpdate, isInitialized]);
 
-  const buildProcessTree = useMemo(() => {
+  const buildProcessTreeCorrect = (
+    processes: Process[],
+    searchQuery: string,
+    showSystemProcesses: boolean
+  ): ProcessNode[] => {
     if (!processes.length) return [];
 
-    let filteredList = [...processes];
+    const nodeMap = new Map<number, ProcessNode>();
 
-    if (searchQuery && searchQuery.trim() !== '') {
-      const query = searchQuery.toLowerCase().trim();
-      filteredList = filteredList.filter((p) => {
-        const name = (p.name || '').toLowerCase();
-        const exe = (p.exe || '').toLowerCase();
-        const command = (p.command || '').toLowerCase();
-        const pid = String(p.pid || '');
-        const ppid = String(p.ppid || '');
-        const cwd = (p.cwd || '').toLowerCase();
-
-        return (
-          name.includes(query) ||
-          exe.includes(query) ||
-          command.includes(query) ||
-          pid.includes(query) ||
-          ppid.includes(query) ||
-          cwd.includes(query)
-        );
-      });
-    }
-
-    if (!showSystemProcesses) {
-      filteredList = filteredList.filter(
-        (p) =>
-          p.uid !== 0 &&
-          p.uid !== undefined &&
-          p.uid > 100 &&
-          !(p.name || '').includes('systemd') &&
-          !(p.name || '').includes('init') &&
-          !(p.name || '').includes('kthreadd')
-      );
-    }
-
-    const processMap = new Map<number, ProcessNode>();
-    const rootProcesses: ProcessNode[] = [];
-
-    filteredList.forEach((process) => {
-      processMap.set(process.pid, {
-        ...process,
+    processes.forEach((p) => {
+      nodeMap.set(p.pid, {
+        ...p,
         children: [],
         depth: 0,
       });
     });
 
-    filteredList.forEach((process) => {
-      const node = processMap.get(process.pid);
-      if (!node) return;
+    const roots: ProcessNode[] = [];
 
-      if (process.ppid > 0) {
-        const parent = processMap.get(process.ppid);
-        if (parent) {
-          parent.children.push(node);
-          node.depth = parent.depth + 1;
-          return;
-        }
+    nodeMap.forEach((node) => {
+      if (node.ppid && nodeMap.has(node.ppid)) {
+        const parent = nodeMap.get(node.ppid)!;
+        parent.children.push(node);
+        node.depth = parent.depth + 1;
+      } else {
+        roots.push(node);
       }
-
-      rootProcesses.push(node);
     });
 
-    const sortChildren = (nodes: ProcessNode[]) => {
-      nodes.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-      nodes.forEach((node) => {
-        if (node.children.length > 0) {
-          sortChildren(node.children);
-        }
+    const sortTree = (nodes: ProcessNode[]) => {
+      nodes.sort(
+        (a, b) =>
+          new Date(b.timestamp).getTime() -
+          new Date(a.timestamp).getTime()
+      );
+      nodes.forEach((n) => {
+        if (n.children.length > 0) sortTree(n.children);
       });
     };
 
-    sortChildren(rootProcesses);
-    return rootProcesses;
+    sortTree(roots);
+
+    const matchesSearch = (p: Process) => {
+      if (!searchQuery) return true;
+      const q = searchQuery.toLowerCase();
+
+      return (
+        (p.name || '').toLowerCase().includes(q) ||
+        (p.exe || '').toLowerCase().includes(q) ||
+        (p.command || '').toLowerCase().includes(q) ||
+        String(p.pid).includes(q) ||
+        String(p.ppid).includes(q) ||
+        String(p.uid || '').includes(q) ||
+        (p.cwd || '').toLowerCase().includes(q)
+      );
+    };
+
+    const isSystemProcess = (p: Process) =>
+      p.uid === 0 ||
+      (p.name || '').includes('systemd') ||
+      (p.name || '').includes('init') ||
+      (p.name || '').includes('kthreadd');
+
+    const filterTree = (nodes: ProcessNode[]): ProcessNode[] => {
+      return nodes
+        .map((node) => {
+          const filteredChildren = filterTree(node.children);
+
+          const visible =
+            matchesSearch(node) &&
+            (showSystemProcesses || !isSystemProcess(node));
+
+          if (visible || filteredChildren.length > 0) {
+            return {
+              ...node,
+              children: filteredChildren,
+            };
+          }
+
+          return null;
+        })
+        .filter(Boolean) as ProcessNode[];
+    };
+
+    return filterTree(roots);
+  };
+
+  const buildProcessTree = useMemo(() => {
+    return buildProcessTreeCorrect(
+      processes,
+      searchQuery,
+      showSystemProcesses
+    );
   }, [processes, searchQuery, showSystemProcesses]);
 
   const stats = useMemo(() => {
@@ -390,6 +518,38 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
     setSelectedProcess(process);
     setIsFlyoutVisible(true);
   };
+
+  const handleStartMonitoring = () => {
+    if (!selectedIndex) {
+      setError('Выберите индекс');
+      return;
+    }
+    if (selectedAgents.length === 0) {
+      setError('Выберите хотя бы одного агента');
+      return;
+    }
+    
+    setError(null);
+    setIsInitialized(true);
+    initialLoad();
+  };
+
+  const handleReset = () => {
+    setIsInitialized(false);
+    setProcesses([]);
+    setError(null);
+    setCurrentOffset(0);
+    setHasMore(true);
+    lastTimestampRef.current = null;
+    processMapRef.current.clear();
+  };
+
+  const agentOptions: ComboBoxOption[] = useMemo(() => {
+    return agents.map(agent => ({
+      label: `${agent.name} (${agent.id}) - ${agent.count} events`,
+      value: agent.id,
+    }));
+  }, [agents]);
 
   const renderProcessDetailsFlyout = () => {
     if (!isFlyoutVisible || !selectedProcess) return null;
@@ -439,12 +599,12 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
                 </>
               )}
 
-              {selectedProcess.command && (
+              {selectedProcess.execve && (
                 <>
-                  <EuiDescriptionListTitle>Command Line</EuiDescriptionListTitle>
+                  <EuiDescriptionListTitle>Execve Details</EuiDescriptionListTitle>
                   <EuiDescriptionListDescription>
-                    <EuiCodeBlock language="bash" paddingSize="s" fontSize="s">
-                      {selectedProcess.command}
+                    <EuiCodeBlock language="json" paddingSize="s" fontSize="s">
+                      {JSON.stringify(selectedProcess.execve, null, 2)}
                     </EuiCodeBlock>
                   </EuiDescriptionListDescription>
                 </>
@@ -578,7 +738,7 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
   };
 
   const treeItems: EuiTreeViewProps['items'] = useMemo(() => {
-    const convertToTreeItem = (node: ProcessNode): any => {
+    const convertToTreeItem = (node: ProcessNode, index: number = 0): any => {
       const isRoot = node.ppid === 0;
       const isSystem = node.uid === 0;
       const isNew = node.isNew;
@@ -591,12 +751,14 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
           }}
           style={{
             cursor: 'pointer',
-            padding: '8px',
+            padding: '8px 12px',
+            marginBottom: '4px',
             borderRadius: '4px',
             transition: 'all 0.3s ease',
             backgroundColor: isNew ? '#E6F9F5' : 'transparent',
             border: isNew ? '2px solid #00BFB3' : '2px solid transparent',
             animation: isNew ? 'pulse 2s ease-in-out' : 'none',
+            display: 'block',
           }}
           onMouseEnter={(e) => {
             if (!isNew) {
@@ -621,21 +783,23 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
               <EuiHealth color={isSystem ? 'danger' : isRoot ? 'warning' : 'success'} />
             </EuiFlexItem>
             <EuiFlexItem grow={false} style={{ minWidth: 150, maxWidth: 400 }}>
-              <EuiText
-                size="s"
-                style={{
-                  fontWeight: isRoot ? 'bold' : 'normal',
-                  fontFamily: 'monospace',
-                  color: isSystem ? '#BD271E' : 'inherit',
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                }}
-              >
-                {node.name}
-                {node.cwd && ` - ${node.cwd}`}
-                {node.command && ` - ${node.command}`}
-              </EuiText>
+              <EuiToolTip content={`${node.exe || node.name}${node.command ? '\n' + node.command : ''}`}>
+                <EuiText
+                  size="s"
+                  style={{
+                    fontWeight: isRoot ? 'bold' : 'normal',
+                    fontFamily: 'monospace',
+                    color: isSystem ? '#BD271E' : 'inherit',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {node.name}
+                  {node.cwd && ` - ${node.cwd}`}
+                  {node.command && ` - ${node.command}`}
+                </EuiText>
+              </EuiToolTip>
             </EuiFlexItem>
             <EuiFlexItem grow={false}>
               <EuiBadge color={isSystem ? 'danger' : 'hollow'}>PID: {node.pid}</EuiBadge>
@@ -658,15 +822,15 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
       );
 
       return {
-        id: `process-${node.pid}-${node._id}`,
+        id: `process-${node.pid}-${node._id}-${index}`,
         label,
         icon: <EuiIcon type={isRoot ? 'node' : 'gear'} size="s" />,
-        children: node.children.length > 0 ? node.children.map(convertToTreeItem) : undefined,
-        isExpanded: expandedNodes[`process-${node.pid}-${node._id}`] || node.depth < 1 || isNew,
+        children: node.children.length > 0 ? node.children.map((child, idx) => convertToTreeItem(child, idx)) : undefined,
+        isExpanded: expandedNodes[`process-${node.pid}-${node._id}-${index}`] || node.depth < 1 || isNew,
       };
     };
 
-    return buildProcessTree.map(convertToTreeItem);
+    return buildProcessTree.map((node, idx) => convertToTreeItem(node, idx));
   }, [buildProcessTree, expandedNodes]);
 
   const handleTimeRangeChange = (range: TimeRange) => {
@@ -681,9 +845,17 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
 
   const handleExpandAll = () => {
     const newExpanded: Record<string, boolean> = {};
-    processes.forEach((p) => {
-      newExpanded[`process-${p.pid}-${p._id}`] = true;
-    });
+    
+    const expandNode = (nodes: ProcessNode[], index: number = 0) => {
+      nodes.forEach((node, idx) => {
+        newExpanded[`process-${node.pid}-${node._id}-${idx}`] = true;
+        if (node.children.length > 0) {
+          expandNode(node.children, idx);
+        }
+      });
+    };
+    
+    expandNode(buildProcessTree);
     setExpandedNodes(newExpanded);
   };
 
@@ -693,6 +865,8 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
 
   const handleManualRefresh = () => {
     lastTimestampRef.current = null;
+    setCurrentOffset(0);
+    setHasMore(true);
     processMapRef.current.clear();
     initialLoad();
   };
@@ -724,80 +898,99 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
             </EuiFlexItem>
             <EuiFlexItem grow={false}>
               <EuiText size="s" color="subdued">
-                {flatList.length} processes
+                {flatList.length} processes {hasMore && '(scroll for more)'}
               </EuiText>
             </EuiFlexItem>
           </EuiFlexGroup>
           <EuiSpacer size="m" />
 
-          {flatList.map((process) => (
-            <div
-              key={process._id}
-              onClick={() => handleProcessClick(process)}
-              style={{
-                padding: '12px',
-                marginBottom: '4px',
-                borderRadius: '4px',
-                border: process.isNew ? '2px solid #00BFB3' : '1px solid #D3DAE6',
-                cursor: 'pointer',
-                transition: 'all 0.3s ease',
-                backgroundColor: process.isNew ? '#E6F9F5' : 'white',
-                animation: process.isNew ? 'slideIn 0.5s ease' : 'none',
-              }}
-              onMouseEnter={(e) => {
-                if (!process.isNew) {
-                  e.currentTarget.style.backgroundColor = '#F5F7FA';
-                  e.currentTarget.style.borderColor = '#98A2B3';
-                }
-              }}
-              onMouseLeave={(e) => {
-                if (!process.isNew) {
-                  e.currentTarget.style.backgroundColor = 'white';
-                  e.currentTarget.style.borderColor = '#D3DAE6';
-                }
-              }}
+          <div 
+            ref={scrollContainerRef} 
+            style={{ maxHeight: '70vh', overflow: 'auto' }}
             >
-              <EuiFlexGroup alignItems="center" responsive={false}>
-                {process.isNew && (
-                  <EuiFlexItem grow={false}>
-                    <EuiBadge color="success" iconType="bullseye">
-                      NEW
-                    </EuiBadge>
+            {flatList.map((process, idx) => (
+              <div
+                key={`${process._id}-${idx}`}
+                onClick={() => handleProcessClick(process)}
+                style={{
+                  padding: '12px',
+                  paddingLeft: `${process.depth * 24 + 12}px`,
+                  marginBottom: '2px',
+                  borderRadius: '4px',
+                  border: process.isNew ? '2px solid #00BFB3' : '1px solid #D3DAE6',
+                  cursor: 'pointer',
+                  transition: 'all 0.3s ease',
+                  backgroundColor: process.isNew ? '#E6F9F5' : 'white',
+                  animation: process.isNew ? 'slideIn 0.5s ease' : 'none',
+                }}
+                onMouseEnter={(e) => {
+                  if (!process.isNew) {
+                    e.currentTarget.style.backgroundColor = '#F5F7FA';
+                    e.currentTarget.style.borderColor = '#98A2B3';
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  if (!process.isNew) {
+                    e.currentTarget.style.backgroundColor = 'white';
+                    e.currentTarget.style.borderColor = '#D3DAE6';
+                  }
+                }}
+              >
+                <EuiFlexGroup alignItems="center" responsive={false}>
+                  {process.isNew && (
+                    <EuiFlexItem grow={false}>
+                      <EuiBadge color="success" iconType="bullseye">
+                        NEW
+                      </EuiBadge>
+                    </EuiFlexItem>
+                  )}
+                  <EuiFlexItem grow={false} style={{ width: 80 }}>
+                    <EuiBadge color="hollow">PID: {process.pid}</EuiBadge>
                   </EuiFlexItem>
-                )}
-                <EuiFlexItem grow={false} style={{ width: 80 }}>
-                  <EuiBadge color="hollow">PID: {process.pid}</EuiBadge>
-                </EuiFlexItem>
-                <EuiFlexItem grow={false} style={{ width: 100 }}>
-                  <EuiBadge color="hollow">PPID: {process.ppid || 0}</EuiBadge>
-                </EuiFlexItem>
-                <EuiFlexItem>
-                  <div>
-                    <EuiText size="s" style={{ fontWeight: 'bold' }}>
-                      {process.name}
-                    </EuiText>
-                    {process.exe && (
-                      <EuiText size="xs" color="subdued">
-                        {process.exe}
+                  <EuiFlexItem grow={false} style={{ width: 100 }}>
+                    <EuiBadge color="hollow">PPID: {process.ppid || 0}</EuiBadge>
+                  </EuiFlexItem>
+                  <EuiFlexItem>
+                    <div>
+                      <EuiText size="s" style={{ fontWeight: 'bold' }}>
+                        {process.name}
                       </EuiText>
-                    )}
-                  </div>
-                </EuiFlexItem>
-                {process.uid !== undefined && (
-                  <EuiFlexItem grow={false}>
-                    <EuiBadge color={process.uid === 0 ? 'danger' : 'default'}>
-                      UID: {process.uid}
-                    </EuiBadge>
+                      {process.exe && (
+                        <EuiText size="xs" color="subdued">
+                          {process.exe}
+                        </EuiText>
+                      )}
+                    </div>
                   </EuiFlexItem>
-                )}
-                <EuiFlexItem grow={false} style={{ width: 120 }}>
-                  <EuiText size="xs" color="subdued">
-                    {new Date(process.timestamp).toLocaleTimeString()}
-                  </EuiText>
-                </EuiFlexItem>
-              </EuiFlexGroup>
-            </div>
-          ))}
+                  {process.uid !== undefined && (
+                    <EuiFlexItem grow={false}>
+                      <EuiBadge color={process.uid === 0 ? 'danger' : 'default'}>
+                        UID: {process.uid}
+                      </EuiBadge>
+                    </EuiFlexItem>
+                  )}
+                  <EuiFlexItem grow={false} style={{ width: 120 }}>
+                    <EuiText size="xs" color="subdued">
+                      {new Date(process.timestamp).toLocaleTimeString()}
+                    </EuiText>
+                  </EuiFlexItem>
+                </EuiFlexGroup>
+              </div>
+            ))}
+            {loadingMore && (
+              <div style={{ textAlign: 'center', padding: '20px' }}>
+                <EuiLoadingSpinner size="m" />
+                <EuiSpacer size="s" />
+                <EuiText size="s" color="subdued">Loading more processes...</EuiText>
+              </div>
+            )}
+            
+            {!hasMore && flatList.length > 0 && (
+              <div style={{ textAlign: 'center', padding: '20px' }}>
+                <EuiText size="s" color="subdued">No more processes to load</EuiText>
+              </div>
+            )}
+          </div>
         </EuiPanel>
       );
     }
@@ -805,6 +998,7 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
     return (
       <EuiPanel paddingSize="none">
         <div
+          ref={scrollContainerRef}
           style={{
             maxHeight: '70vh',
             overflow: 'auto',
@@ -821,6 +1015,7 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
               </EuiText>
             </div>
           ) : (
+          <>
             <EuiTreeView
               items={treeItems}
               display="compressed"
@@ -828,18 +1023,131 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
               expandByDefault={false}
               aria-label="Process Tree"
             />
+
+            {loadingMore && (
+              <div style={{ textAlign: 'center', padding: '20px' }}>
+                <EuiLoadingSpinner size="m" />
+                <EuiSpacer size="s" />
+                <EuiText size="s" color="subdued">Loading more processes...</EuiText>
+              </div>
+            )}
+            
+            {!hasMore && (
+              <div style={{ textAlign: 'center', padding: '20px' }}>
+                <EuiText size="s" color="subdued">No more processes to load</EuiText>
+              </div>
+            )}
+          </>
           )}
         </div>
       </EuiPanel>
     );
   };
 
+  if (!isInitialized) {
+    return (
+      <EuiPage>
+        <EuiPageBody>
+          <EuiPageContent verticalPosition="center" horizontalPosition="center">
+            <EuiEmptyPrompt
+              icon={<EuiIcon type="search" size="xxl" />}
+              title={<h2>Process Tree Viewer</h2>}
+              body={
+                <>
+                  <EuiText>
+                    <p>Select data source and agents to start monitoring</p>
+                  </EuiText>
+                  <EuiSpacer size="xl" />
+                  
+                  <EuiPanel style={{ maxWidth: 700, margin: '0 auto' }}>
+                    <EuiFormRow label="Data Source" fullWidth>
+                      <EuiSelect
+                        value={selectedIndex}
+                        onChange={(e: ChangeEvent<HTMLSelectElement>) => {
+                          console.log('Index selected:', e.target.value);
+                          setSelectedIndex(e.target.value);
+                          setSelectedAgents([]);
+                          setError(null);
+                        }}
+                        options={[
+                          { value: '', text: 'Select index...' },
+                          ...indices.map((index) => ({
+                            value: index.index,
+                            text: `${index.index} (${index['docs.count']} docs)`,
+                          })),
+                        ]}
+                        isLoading={loadingIndices}
+                        fullWidth
+                      />
+                    </EuiFormRow>
+
+                    <EuiSpacer size="m" />
+
+                    <EuiFormRow 
+                      label="Agents" 
+                      fullWidth
+                      helpText={
+                        !selectedIndex 
+                          ? 'Select an index first' 
+                          : loadingAgents 
+                          ? 'Loading agents...' 
+                          : agents.length === 0 
+                          ? 'No agents found in selected index' 
+                          : `${agents.length} agents available`
+                      }
+                    >
+                      <EuiComboBox
+                        placeholder="Select one or more agents..."
+                        options={agentOptions}
+                        selectedOptions={selectedAgents}
+                        onChange={(selected) => {
+                          console.log('Agents selected:', selected);
+                          setSelectedAgents(selected);
+                          setError(null);
+                        }}
+                        isLoading={loadingAgents}
+                        isDisabled={!selectedIndex || agents.length === 0}
+                        isClearable={true}
+                        fullWidth
+                      />
+                    </EuiFormRow>
+
+                    {error && (
+                      <>
+                        <EuiSpacer size="m" />
+                        <EuiCallOut title="Error" color="danger" iconType="alert" size="s">
+                          {error}
+                        </EuiCallOut>
+                      </>
+                    )}
+
+                    <EuiSpacer size="xl" />
+
+                    <EuiButton
+                      fill
+                      fullWidth
+                      onClick={handleStartMonitoring}
+                      isDisabled={!selectedIndex || selectedAgents.length === 0}
+                      iconType="play"
+                    >
+                      Start Monitoring
+                    </EuiButton>
+                  </EuiPanel>
+                </>
+              }
+            />
+          </EuiPageContent>
+        </EuiPageBody>
+      </EuiPage>
+    );
+  }
+
   return (
     <EuiPage>
       <EuiPageBody>
         <EuiPageHeader
           pageTitle="Process Tree Viewer"
-          description="Real-time process monitoring and analysis"
+          description={`Monitoring: ${selectedAgents.map(a => a.label).join(', ')}`}
           rightSideItems={[
             <EuiFlexGroup gutterSize="s" alignItems="center">
               {isUpdating && (
@@ -864,7 +1172,7 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
                   iconType="refresh"
                   isLoading={loading}
                 >
-                  Full Refresh
+                  Refresh
                 </EuiButton>
               </EuiFlexItem>
               <EuiFlexItem grow={false}>
@@ -874,6 +1182,16 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
                   onChange={(e) => setAutoRefresh(e.target.checked)}
                 />
               </EuiFlexItem>
+              <EuiFlexItem grow={false}>
+                <EuiButtonEmpty
+                  size="s"
+                  onClick={handleReset}
+                  iconType="cross"
+                  color="danger"
+                >
+                  Reset
+                </EuiButtonEmpty>
+              </EuiFlexItem>
             </EuiFlexGroup>,
           ]}
         />
@@ -882,7 +1200,6 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
 
         <EuiPageContent>
           <EuiPageContentBody>
-            {/* Панель управления */}
             <EuiPanel>
               <EuiFlexGroup gutterSize="m" alignItems="flexEnd">
                 <EuiFlexItem grow={2}>
@@ -893,6 +1210,7 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
                         setSelectedIndex(e.target.value);
                         lastTimestampRef.current = null;
                         processMapRef.current.clear();
+                        setSelectedAgents([]);
                       }}
                       options={[
                         { value: '', text: 'Select index...' },
@@ -938,33 +1256,45 @@ export const ProcessTreeViewerApp: React.FC<Props> = ({ http }) => {
 
               <EuiSpacer size="m" />
 
-              <EuiFlexGroup gutterSize="m" alignItems="center">
-                <EuiFlexItem grow={3}>
-                  <EuiFormRow label="Search Processes" fullWidth>
-                    <EuiFieldSearch
-                      placeholder="Search by name, PID, PPID, exe, command, cwd..."
-                      value={searchQuery}
-                      onChange={(e: ChangeEvent<HTMLInputElement>) =>
-                        setSearchQuery(e.target.value)
-                      }
-                      isClearable
+              <EuiFlexGroup gutterSize="m" alignItems="flexEnd">
+                <EuiFlexItem grow={2}>
+                  <EuiFormRow 
+                    label="Agents" 
+                    fullWidth
+                    helpText={
+                      !selectedIndex 
+                        ? 'Select an index first' 
+                        : loadingAgents 
+                        ? 'Loading agents...' 
+                        : agents.length === 0 
+                        ? 'No agents found' 
+                        : `${agents.length} agents available`
+                    }
+                  >
+                    <EuiComboBox
+                      placeholder="Select agents (all if empty)"
+                      options={agentOptions}
+                      selectedOptions={selectedAgents}
+                      onChange={(selected) => {
+                        setSelectedAgents(selected);
+                      }}
+                      isLoading={loadingAgents}
+                      isDisabled={!selectedIndex || agents.length === 0}
+                      isClearable={true}
                       fullWidth
                     />
                   </EuiFormRow>
                 </EuiFlexItem>
 
-                <EuiFlexItem grow={1}>
-                  <EuiFormRow label="Limit" fullWidth>
-                    <EuiRange
-                      min={100}
-                      max={5000}
-                      step={100}
-                      value={limit}
-                      onChange={(event, isValid) => {
-                        if (!isValid) return;
-                        setLimit(Number(event.currentTarget.value));
-                      }}
-                      showValue
+                <EuiFlexItem grow={3}>
+                  <EuiFormRow label="Search Processes" fullWidth helpText="Search by name, PID, PPID, UID, exe, command, cwd">
+                    <EuiFieldSearch
+                      placeholder="Search..."
+                      value={searchQuery}
+                      onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                        setSearchQuery(e.target.value)
+                      }
+                      isClearable
                       fullWidth
                     />
                   </EuiFormRow>
